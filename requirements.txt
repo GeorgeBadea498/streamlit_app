@@ -1,10 +1,8 @@
-streamlit
-streamlit-webrtc
-ultralytics
-opencv-python
-Pillow
+streamlit>=1.20.0
+opencv-python-headless==4.9.0.80
 numpy
 pandas
-matplotlib
-python-multipart
-
+ultralytics
+torch
+imageio
+streamlit-webrtc   # only if you use it

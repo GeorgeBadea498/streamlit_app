@@ -9,8 +9,10 @@ import time
 import altair as alt
 import traceback
 
-# streamlit-webrtc imports wrapped in try/except (import errors will be shown)
+# Try to import streamlit-webrtc and av. If this fails we'll use a camera_input fallback.
 webrtc_available = True
+webrtc_import_exception = None
+webrtc_import_traceback = None
 try:
     from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
     import av
@@ -87,15 +89,20 @@ elif page == "App":
     # -----------------------------
     @st.cache_resource
     def load_yolo():
-        return YOLO("Team5.pt")  # fixed model
+        # Change path if necessary; ensure Team5.pt is in your repo or adjust to a public path
+        return YOLO("Team5.pt")
 
     model = load_yolo()
 
     # -----------------------------
     # Helper: Run YOLO on Frames
     # -----------------------------
-    def process_frame(frame, conf):
-        results = model(frame, conf=conf)
+    def process_frame(frame_rgb, conf):
+        """
+        frame_rgb: HxWx3 RGB numpy array
+        returns: annotated RGB numpy array
+        """
+        results = model(frame_rgb, conf=conf)
         annotated = results[0].plot()
         return annotated
 
@@ -156,65 +163,105 @@ elif page == "App":
     elif upload_option == "Use Webcam":
         st.subheader("Webcam Detection (continuous)")
 
-        # If webrtc wasn't importable, show the import error and stop here
+        # If webrtc import failed earlier, show error and automatically use fallback below.
         if not webrtc_available:
-            st.error("streamlit-webrtc (or its dependencies) failed to import on the server.")
-            st.write("Exception:")
+            st.error("streamlit-webrtc (or its dependencies) failed to import on the server; using camera_input fallback.")
+            st.write("Import exception:")
             st.code(str(webrtc_import_exception))
             st.write("Full traceback:")
             st.text(webrtc_import_traceback)
-            st.info(
-                "Common causes: PyAV (`av`) failed to build on the cloud builder or aiortc is missing. "
-                "See requirements.txt suggestions in the project and consider deploying to a host that provides prebuilt binary wheels or conda-forge."
+
+            # FALLBACK: camera_input snapshot loop (reliable on Streamlit Cloud)
+            st.info("Fallback: Please allow camera access in the browser. The app will capture snapshots and process them.")
+            file = st.camera_input("Allow camera and take a snapshot")
+
+            frame_placeholder = st.empty()
+            if file is not None:
+                # Read bytes into numpy and process
+                file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+                bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                processed = process_frame(rgb, confidence_threshold)
+                frame_placeholder.image(processed, channels="RGB")
+            else:
+                st.info("Waiting for camera permission / initial snapshot. Click the camera widget to take a photo.")
+
+        else:
+            # RTC configuration (use Google STUN server for NAT traversal; add TURN if required)
+            rtc_configuration = RTCConfiguration(
+                {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
             )
-            st.stop()
 
-        # RTC configuration (Google STUN as a starter; TURN may be required on some networks)
-        rtc_configuration = RTCConfiguration(
-            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-        )
+            # Processor class: internal frame-skipping to control inference rate without depending on
+            # webrtc_streamer optional parameters that may not exist in all versions.
+            class YoloProcessor(VideoProcessorBase):
+                def __init__(self):
+                    self.model = model
+                    self.conf = confidence_threshold
+                    self.frame_count = 0
+                    # process 1 of every N frames to reduce CPU load / inference rate
+                    # tune this value depending on model size / CPU power
+                    self.process_every_n = 2  # change to 3 or 4 to reduce load further
 
-        class SimpleProcessor(VideoProcessorBase):
-            def __init__(self):
-                self.model = model
-                self.conf = confidence_threshold
+                def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+                    self.frame_count += 1
+                    img_bgr = frame.to_ndarray(format="bgr24")
 
-            def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-                img_bgr = frame.to_ndarray(format="bgr24")
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                try:
-                    results = self.model(img_rgb, conf=self.conf)
-                    annotated = results[0].plot()
-                    if annotated.ndim == 3:
+                    # Skip heavy inference on most frames: return original frame unchanged.
+                    if (self.frame_count % self.process_every_n) != 0:
+                        return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
+
+                    # Do inference on selected frames
+                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    try:
+                        results = self.model(img_rgb, conf=self.conf)
+                        annotated = results[0].plot()
+                        # convert annotated (RGB) back to BGR for returning
                         out_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
-                    else:
-                        out_bgr = annotated
-                    return av.VideoFrame.from_ndarray(out_bgr, format="bgr24")
-                except Exception as e:
-                    # On inference error, draw the message and return original frame
-                    cv2.putText(img_bgr, "Inference error", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-                    return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
+                        return av.VideoFrame.from_ndarray(out_bgr, format="bgr24")
+                    except Exception as e:
+                        # On inference error, overlay message and return original frame
+                        cv2.putText(img_bgr, "Inference error", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
 
-        # Wrap webrtc_streamer in try/except to capture runtime exceptions and show traceback
-        try:
-            webrtc_ctx = webrtc_streamer(
-                key="yolo-webcam",
-                rtc_configuration=rtc_configuration,
-                video_processor_factory=SimpleProcessor,
-                media_stream_constraints={"video": True, "audio": False},
-                async_processing=True,
-                desired_playing_fps=15,
-            )
-        except Exception as e:
-            st.error("webrtc_streamer raised an exception during initialization.")
-            st.write("Exception:")
-            st.code(str(e))
-            st.write("Full traceback:")
-            st.text(traceback.format_exc())
-            st.info(
-                "If this is an ImportError/BuildError for `av` or `aiortc`, inspect build logs in Streamlit Cloud. "
-                "If WebRTC initializes but shows a black screen, check browser console for ICE/getUserMedia errors."
-            )
+            # Initialize the stream. Note: we do NOT pass 'desired_playing_fps' to avoid
+            # API mismatch errors on older/newer streamlit-webrtc versions.
+            try:
+                webrtc_ctx = webrtc_streamer(
+                    key="yolo-webcam",
+                    rtc_configuration=rtc_configuration,
+                    video_processor_factory=YoloProcessor,
+                    media_stream_constraints={"video": True, "audio": False},
+                    async_processing=True,
+                )
+            except Exception as e:
+                # Show full initialization traceback in the UI for diagnosis
+                st.error("webrtc_streamer raised an exception during initialization. Falling back to camera_input.")
+                st.write("Exception:")
+                st.code(str(e))
+                st.write("Full traceback:")
+                st.text(traceback.format_exc())
+
+                # FALLBACK to camera_input (same as above)
+                st.info("Fallback: Please allow camera access in the browser. The app will capture snapshots and process them.")
+                file = st.camera_input("Allow camera and take a snapshot")
+
+                frame_placeholder = st.empty()
+                if file is not None:
+                    file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+                    bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    processed = process_frame(rgb, confidence_threshold)
+                    frame_placeholder.image(processed, channels="RGB")
+                else:
+                    st.info("Waiting for camera permission / initial snapshot. Click the camera widget to take a photo.")
+            else:
+                # keep the processor's confidence synced with the sidebar slider while running
+                if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
+                    webrtc_ctx.video_processor.conf = confidence_threshold
+                    st.sidebar.success("Webcam streaming: running")
+                else:
+                    st.sidebar.info("Webcam not running yet. Allow camera permissions and click 'Start' in the stream.")
 
 # -----------------------------
 # PAGE: METRICS (Altair robust implementation)

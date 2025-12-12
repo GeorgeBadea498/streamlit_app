@@ -5,4 +5,5 @@ pandas
 ultralytics
 torch
 imageio
-streamlit-webrtc   # only if you use it
+streamlit-webrtc 
+
